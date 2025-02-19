@@ -14,16 +14,38 @@ import memcache
 import appsinstalled_pb2
 
 NORMAL_ERR_RATE = 0.01
-BATCH_SIZE = 1000
-
 AppsInstalled = collections.namedtuple(
     "AppsInstalled", ["dev_type", "dev_id", "lat", "lon", "apps"]
 )
+
+print(dir(memcache))
 
 
 def dot_rename(path):
     head, fn = os.path.split(path)
     os.rename(path, os.path.join(head, "." + fn))
+
+
+def insert_appsinstalled(memc_addr, appsinstalled, dry_run=False):
+    logging.info(f"Attempting to insert data for {appsinstalled.dev_id} at {memc_addr}")
+    ua = appsinstalled_pb2.UserApps()
+    ua.lat = appsinstalled.lat
+    ua.lon = appsinstalled.lon
+    key = f"{appsinstalled.dev_type}:{appsinstalled.dev_id}"
+    ua.apps.extend(appsinstalled.apps)
+    packed = ua.SerializeToString()
+    try:
+        if dry_run:
+            logging.debug(f"{memc_addr} - {key} -> {str(ua).replace('\n', ' ')}")
+        else:
+            memc = memcache.Client([memc_addr], socket_timeout=1)
+            logging.info(f"Connected to Memcached at {memc_addr}")
+            memc.set(key, packed)
+            logging.info(f"Successfully set key {key}")
+    except Exception as e:
+        logging.exception(f"Cannot write to memc {memc_addr}: {e}")
+        return False
+    return True
 
 
 def parse_appsinstalled(line):
@@ -47,15 +69,6 @@ def parse_appsinstalled(line):
 
 def process_file(fn, device_memc, dry_run):
     processed = errors = 0
-    batch_size = BATCH_SIZE
-    memc_clients = {}
-    pending = {}
-
-    memcache_addresses = set(device_memc.values())
-    for memc_addr in memcache_addresses:
-        memc_clients[memc_addr] = memcache.Client([memc_addr], socket_timeout=1)
-        pending[memc_addr] = {}
-
     logging.info(f"Processing {fn}")
     with gzip.open(fn, "rt", encoding="utf-8") as fd:
         for line in fd:
@@ -66,67 +79,16 @@ def process_file(fn, device_memc, dry_run):
             if not appsinstalled:
                 errors += 1
                 continue
-
             memc_addr = device_memc.get(appsinstalled.dev_type)
             if not memc_addr:
                 errors += 1
                 logging.error(f"Unknown device type: {appsinstalled.dev_type}")
                 continue
-
-            ua = appsinstalled_pb2.UserApps()
-            ua.lat = appsinstalled.lat
-            ua.lon = appsinstalled.lon
-            ua.apps.extend(appsinstalled.apps)
-            key = f"{appsinstalled.dev_type}:{appsinstalled.dev_id}"
-            packed = ua.SerializeToString()
-
-            if dry_run:
-                logging.debug(f"{memc_addr} - {key} -> {str(ua).replace('\n', ' ')}")
+            ok = insert_appsinstalled(memc_addr, appsinstalled, dry_run)
+            if ok:
                 processed += 1
-                continue
-
-            pending[memc_addr][key] = packed
-
-            if len(pending[memc_addr]) >= batch_size:
-                try:
-                    memc = memc_clients[memc_addr]
-                    failed_keys = memc.set_multi(pending[memc_addr])
-                    if failed_keys:
-                        logging.error(
-                            f"Failed keys when setting to {memc_addr}: {failed_keys}"
-                        )
-                        errors += len(failed_keys)
-                    processed += len(pending[memc_addr]) - len(failed_keys)
-                except Exception as e:
-                    logging.exception(f"Cannot write to memc {memc_addr}: {e}")
-                    errors += len(pending[memc_addr])
-                finally:
-                    pending[memc_addr].clear()
-
-        for memc_addr, kv in pending.items():
-            if kv:
-                if dry_run:
-                    for k, v in kv.items():
-                        logging.debug(
-                            f"{memc_addr} - {k} -> {str(v).replace('\n', ' ')}"
-                        )
-                    processed += len(kv)
-                    continue
-                try:
-                    memc = memc_clients[memc_addr]
-                    failed_keys = memc.set_multi(kv)
-                    if failed_keys:
-                        logging.error(
-                            f"Failed keys when setting to {memc_addr}: {failed_keys}"
-                        )
-                        errors += len(failed_keys)
-                    processed += len(kv) - len(failed_keys)
-                except Exception as e:
-                    logging.exception(f"Cannot write to memc {memc_addr}: {e}")
-                    errors += len(kv)
-                finally:
-                    kv.clear()
-
+            else:
+                errors += 1
     if not processed:
         dot_rename(fn)
         return
