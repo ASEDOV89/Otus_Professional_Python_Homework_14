@@ -6,6 +6,7 @@ import gzip
 import logging
 import os
 import sys
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from optparse import OptionParser
 
